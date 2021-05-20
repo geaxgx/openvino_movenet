@@ -11,6 +11,26 @@ from openvino.inference_engine import IENetwork, IECore
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_MODEL = SCRIPT_DIR / "models/movenet_singlepose_lightning_FP32.xml"
 
+# Dictionary that maps from joint names to keypoint indices.
+KEYPOINT_DICT = {
+    'nose': 0,
+    'left_eye': 1,
+    'right_eye': 2,
+    'left_ear': 3,
+    'right_ear': 4,
+    'left_shoulder': 5,
+    'right_shoulder': 6,
+    'left_elbow': 7,
+    'right_elbow': 8,
+    'left_wrist': 9,
+    'right_wrist': 10,
+    'left_hip': 11,
+    'right_hip': 12,
+    'left_knee': 13,
+    'right_knee': 14,
+    'left_ankle': 15,
+    'right_ankle': 16
+}
 
 # LINES_*_BODY are used when drawing the skeleton onto the source image. 
 # Each variable is a list of continuous lines.
@@ -21,34 +41,36 @@ LINES_BODY = [[4,2],[2,0],[0,1],[1,3],
                 [6,12],[12,11],[11,5],
                 [12,14],[14,16],[11,13],[13,15]]
 
-class Region:
-    # One region per body detected. With this version of Movenet, one and only one body 
-    def __init__(self, scores=None, landmarks_norm=None):
-        self.scores = scores # scores of the landmarks
-        self.landmarks_norm = landmarks_norm # Landmark normalized ([0,1]) coordinates (x,y) in the squared input image
-        self.landmarks = None # Landmarks coordinates (x,y) in pixels in the source image
+class Body:
+    def __init__(self, scores=None, keypoints_norm=None):
+        self.scores = scores # scores of the keypoints
+        self.keypoints_norm = keypoints_norm # Keypoints normalized ([0,1]) coordinates (x,y) in the squared input image
+        self.keypoints = None # keypoints coordinates (x,y) in pixels in the source image
 
     def print(self):
         attrs = vars(self)
         print('\n'.join("%s: %s" % item for item in attrs.items()))
 
+CropRegion = namedtuple('CropRegion',['xmin', 'ymin', 'xmax',  'ymax', 'size']) # All values are in pixel. The region is a square of size 'size' pixels
+
+
+
+    
 
 class MovenetOpenvino:
     def __init__(self, input_src=None,
                 xml=DEFAULT_MODEL, 
                 device="CPU",
-                score_thresh=0.15,
-                crop=False,
+                score_thresh=0.2,
                 output=None):
         
         self.score_thresh = score_thresh
-        self.crop = crop
          
         if input_src.endswith('.jpg') or input_src.endswith('.png') :
             self.input_type= "image"
             self.img = cv2.imread(input_src)
             self.video_fps = 25
-            video_height, video_width = self.img.shape[:2]
+            self.img_h, self.img_w = self.img.shape[:2]
         else:
             self.input_type = "video"
             if input_src.isdigit():
@@ -56,27 +78,35 @@ class MovenetOpenvino:
                 input_src = int(input_src)
             self.cap = cv2.VideoCapture(input_src)
             self.video_fps = int(self.cap.get(cv2.CAP_PROP_FPS))
-            video_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            video_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.img_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.img_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         print("Video FPS:", self.video_fps)
-
-        # 17 landmarks
-        self.nb_lms = 17
     
         # Load Openvino models
         self.load_model(xml, device)     
 
         # Rendering flags
         self.show_fps = True
+        self.show_crop = False
 
-
-
-        if output is None:
+        if output is None: 
             self.output = None
         else:
-            fourcc = cv2.VideoWriter_fourcc(*"MJPG")
-            self.output = cv2.VideoWriter(output,fourcc,self.video_fps,(video_width, video_height)) 
+            if self.input_type == "image":
+                # For an source image, we will output one image (and not a video) and exit
+                self.output = output
+            else:
+                fourcc = cv2.VideoWriter_fourcc(*"MJPG")
+                self.output = cv2.VideoWriter(output,fourcc,self.video_fps,(self.img_w, self.img_h)) 
 
+        # Defines the default crop region (pads the full image from both sides to make it a square image) 
+        # Used when the algorithm cannot reliably determine the crop region from the previous frame.
+        box_size = max(self.img_w, self.img_h)
+        x_min = (self.img_w - box_size) // 2
+        y_min = (self.img_h - box_size) // 2
+        self.init_crop_region = CropRegion(x_min, y_min, x_min+box_size, y_min+box_size, box_size)
+        print("init crop", self.init_crop_region)
+        
     def load_model(self, xml_path, device):
 
         print("Loading Inference Engine")
@@ -108,25 +138,110 @@ class MovenetOpenvino:
         self.infer_nb = 0
         self.infer_time_cumul = 0
 
-         
-    def pd_postprocess(self, inference):
+    def crop_and_resize(self, frame, crop_region):
+        """Crops and resize the image to prepare for the model input."""
+        cropped = frame[max(0,crop_region.ymin):min(self.img_h,crop_region.ymax), max(0,crop_region.xmin):min(self.img_w,crop_region.xmax)]
+        
+        if crop_region.xmin < 0 or crop_region.xmax >= self.img_w or crop_region.ymin < 0 or crop_region.ymax >= self.img_h:
+            # Padding is necessary        
+            cropped = cv2.copyMakeBorder(cropped, 
+                                        max(0,-crop_region.ymin), 
+                                        max(0, crop_region.ymax-self.img_h),
+                                        max(0,-crop_region.xmin), 
+                                        max(0, crop_region.xmax-self.img_w),
+                                        cv2.BORDER_CONSTANT)
+
+        cropped = cv2.resize(cropped, (self.pd_w, self.pd_h), interpolation=cv2.INTER_AREA)
+        return cropped
+
+    def torso_visible(self, scores):
+        """Checks whether there are enough torso keypoints.
+
+        This function checks whether the model is confident at predicting one of the
+        shoulders/hips which is required to determine a good crop region.
+        """
+        return ((scores[KEYPOINT_DICT['left_hip']] > self.score_thresh or
+                scores[KEYPOINT_DICT['right_hip']] > self.score_thresh) and
+                (scores[KEYPOINT_DICT['left_shoulder']] > self.score_thresh or
+                scores[KEYPOINT_DICT['right_shoulder']] > self.score_thresh))
+
+    def determine_torso_and_body_range(self, keypoints, scores, center_x, center_y):
+        """Calculates the maximum distance from each keypoints to the center location.
+
+        The function returns the maximum distances from the two sets of keypoints:
+        full 17 keypoints and 4 torso keypoints. The returned information will be
+        used to determine the crop size. See determine_crop_region for more detail.
+        """
+        # import pdb
+        # pdb.set_trace()
+        torso_joints = ['left_shoulder', 'right_shoulder', 'left_hip', 'right_hip']
+        max_torso_yrange = 0.0
+        max_torso_xrange = 0.0
+        for joint in torso_joints:
+            dist_y = abs(center_y - keypoints[KEYPOINT_DICT[joint]][1])
+            dist_x = abs(center_x - keypoints[KEYPOINT_DICT[joint]][0])
+            if dist_y > max_torso_yrange:
+                max_torso_yrange = dist_y
+            if dist_x > max_torso_xrange:
+                max_torso_xrange = dist_x
+
+        max_body_yrange = 0.0
+        max_body_xrange = 0.0
+        for i in range(len(KEYPOINT_DICT)):
+            if scores[i] < self.score_thresh:
+                continue
+            dist_y = abs(center_y - keypoints[i][1])
+            dist_x = abs(center_x - keypoints[i][0])
+            if dist_y > max_body_yrange:
+                max_body_yrange = dist_y
+            if dist_x > max_body_xrange:
+                max_body_xrange = dist_x
+
+        return [max_torso_yrange, max_torso_xrange, max_body_yrange, max_body_xrange]
+
+    def determine_crop_region(self, body):
+        """Determines the region to crop the image for the model to run inference on.
+
+        The algorithm uses the detected joints from the previous frame to estimate
+        the square region that encloses the full body of the target person and
+        centers at the midpoint of two hip joints. The crop size is determined by
+        the distances between each joints and the center point.
+        When the model is not confident with the four torso joint predictions, the
+        function returns a default crop which is the full image padded to square.
+        """
+        if self.torso_visible(body.scores):
+            center_x = (body.keypoints[KEYPOINT_DICT['left_hip']][0] + body.keypoints[KEYPOINT_DICT['right_hip']][0]) // 2
+            center_y = (body.keypoints[KEYPOINT_DICT['left_hip']][1] + body.keypoints[KEYPOINT_DICT['right_hip']][1]) // 2
+            max_torso_yrange, max_torso_xrange, max_body_yrange, max_body_xrange = self.determine_torso_and_body_range(body.keypoints, body.scores, center_x, center_y)
+            crop_length_half = np.amax([max_torso_xrange * 1.9, max_torso_yrange * 1.9, max_body_yrange * 1.2, max_body_xrange * 1.2])
+            tmp = np.array([center_x, self.img_w - center_x, center_y, self.img_h - center_y])
+            crop_length_half = int(round(np.amin([crop_length_half, np.amax(tmp)])))
+            crop_corner = [center_x - crop_length_half, center_y - crop_length_half]
+
+            if crop_length_half > max(self.img_w, self.img_h) / 2:
+                return self.init_crop_region
+            else:
+                crop_length = crop_length_half * 2
+                return CropRegion(crop_corner[0], crop_corner[1], crop_corner[0]+crop_length, crop_corner[1]+crop_length,crop_length)
+        else:
+            return self.init_crop_region
+
+    def pd_postprocess(self, inference, crop_region):
         kps = np.squeeze(inference[self.pd_kps]) # 17x3
-        region = Region(scores=kps[:,2], landmarks_norm=kps[:,[1,0]])
-        region.landmarks = (region.landmarks_norm * self.frame_size).astype(np.int)
-        if self.pad_h > 0:
-            region.landmarks[:,1] -= self.pad_h
-        if self.pad_w > 0:
-            region.landmarks[:,0] -= self.pad_w
-        self.regions = [region]
+        # kps = np.where(kps<0, kps+1, kps) # Bug with Openvino 2021.2
+        body = Body(scores=kps[:,2], keypoints_norm=kps[:,[1,0]])
+        body.keypoints = (np.array([crop_region.xmin, crop_region.ymin]) + body.keypoints_norm * crop_region.size).astype(np.int)
+        body.next_crop_region = self.determine_crop_region(body)
+        return body
         
 
-    def pd_render(self, frame, region):
+    def pd_render(self, frame, body, crop_region):
 
-        lines = [np.array([region.landmarks[point] for point in line]) for line in LINES_BODY if region.scores[line[0]] > self.score_thresh and region.scores[line[1]] > self.score_thresh]
+        lines = [np.array([body.keypoints[point] for point in line]) for line in LINES_BODY if body.scores[line[0]] > self.score_thresh and body.scores[line[1]] > self.score_thresh]
         cv2.polylines(frame, lines, False, (255, 180, 90), 2, cv2.LINE_AA)
         
-        for i,x_y in enumerate(region.landmarks):
-            if region.scores[i] > self.score_thresh:
+        for i,x_y in enumerate(body.keypoints):
+            if body.scores[i] > self.score_thresh:
                 if i % 2 == 1:
                     color = (0,255,0) 
                 elif i == 0:
@@ -134,6 +249,9 @@ class MovenetOpenvino:
                 else:
                     color = (0,0,255)
                 cv2.circle(frame, (x_y[0], x_y[1]), 4, color, -11)
+
+        if self.show_crop:
+            cv2.rectangle(frame, (crop_region.xmin, crop_region.ymin), (crop_region.xmax, crop_region.ymax), (0,255,255), 2)
 
                 
     def run(self):
@@ -143,59 +261,42 @@ class MovenetOpenvino:
         nb_pd_inferences = 0
         glob_pd_rtrip_time = 0
 
-        get_new_frame = True
-        use_previous_landmarks = False
+        use_previous_keypoints = False
+
+        crop_region = self.init_crop_region
 
         while True:
-            if get_new_frame:
                 
-                if self.input_type == "image":
-                    src_frame = self.img.copy()
-                else:
-                    ok, src_frame = self.cap.read()
-                    if not ok:
-                        break
-                h, w = src_frame.shape[:2]
-                if self.crop:
-                    # Cropping the long side to get a square shape
-                    self.frame_size = min(h, w)
-                    dx = (w - self.frame_size) // 2
-                    dy = (h - self.frame_size) // 2
-                    self.pad_h = self.pad_w = 0
-                    square_frame = src_frame = src_frame[dy:dy+self.frame_size, dx:dx+self.frame_size]
-                else:
-                    # Padding on the small side to get a square shape
-                    self.frame_size = max(h, w)
-                    self.pad_h = int((self.frame_size - h)/2)
-                    self.pad_w = int((self.frame_size - w)/2)
-                    square_frame = cv2.copyMakeBorder(src_frame, self.pad_h, self.pad_h, self.pad_w, self.pad_w, cv2.BORDER_CONSTANT)
-
-            if False: # use_previous_landmarks:
-                self.regions = regions_from_landmarks
-                mpu.detections_to_rect(self.regions, kp_pair=[0,1]) # self.regions.pd_kps are initialized from landmarks on previous frame
-                mpu.rect_transformation(self.regions, self.frame_size, self.frame_size)
+            if self.input_type == "image":
+                frame = self.img.copy()
             else:
-                # Infer pose detection
-                # Resize image to NN square input shape
-                frame_nn = cv2.resize(square_frame, (self.pd_w, self.pd_h), interpolation=cv2.INTER_AREA)
-                frame_nn = cv2.cvtColor(frame_nn, cv2.COLOR_BGR2RGB).astype(np.float32)[None,] 
-    
-                pd_rtrip_time = now()
-                inference = self.pd_exec_net.infer(inputs={self.pd_input_blob: frame_nn})
-                glob_pd_rtrip_time += now() - pd_rtrip_time
-                self.pd_postprocess(inference)
-                for r in self.regions:
-                    self.pd_render(src_frame, r)
-                nb_pd_inferences += 1
+                ok, frame = self.cap.read()
+                if not ok:
+                    break
+
+            cropped = self.crop_and_resize(frame, crop_region)
+                
+            frame_nn = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB).astype(np.float32)[None,] 
+            pd_rtrip_time = now()
+            inference = self.pd_exec_net.infer(inputs={self.pd_input_blob: frame_nn})
+            glob_pd_rtrip_time += now() - pd_rtrip_time
+            body = self.pd_postprocess(inference, crop_region)
+            self.pd_render(frame, body, crop_region)
+            crop_region = body.next_crop_region
+            nb_pd_inferences += 1
 
             self.fps.update()               
 
             if self.show_fps:
-                self.fps.draw(src_frame, orig=(50,50), size=1, color=(240,180,100))
-            cv2.imshow("Movepose", src_frame)
+                self.fps.draw(frame, orig=(50,50), size=1, color=(240,180,100))
+            cv2.imshow("Movepose", frame)
 
             if self.output:
-                self.output.write(src_frame)
+                if self.input_type == "image":
+                    cv2.imwrite(self.output, frame)
+                    break
+                else:
+                    self.output.write(frame)
 
             key = cv2.waitKey(1) 
             if key == ord('q') or key == 27:
@@ -205,14 +306,18 @@ class MovenetOpenvino:
                 cv2.waitKey(0)
             elif key == ord('f'):
                 self.show_fps = not self.show_fps
+            elif key == ord('c'):
+                self.show_crop = not self.show_crop
 
         # Print some stats
-        global_fps, nb_frames = self.fps.get_global()
-        print(f"FPS : {global_fps:.1f} f/s (# frames = {nb_frames})")
-        print(f"# pose detection inferences : {nb_pd_inferences}")
-        print(f"Pose detection round trip   : {glob_pd_rtrip_time/nb_pd_inferences*1000:.1f} ms")
+        if nb_pd_inferences > 1:
+            global_fps, nb_frames = self.fps.get_global()
 
-        if self.output:
+            print(f"FPS : {global_fps:.1f} f/s (# frames = {nb_frames})")
+            print(f"# pose detection inferences : {nb_pd_inferences}")
+            print(f"Pose detection round trip   : {glob_pd_rtrip_time/nb_pd_inferences*1000:.1f} ms")
+
+        if self.output and self.input_type != "image":
             self.output.release()
            
 
@@ -228,10 +333,8 @@ if __name__ == "__main__":
                         help="Path to an .xml file for model")
     parser.add_argument("-d", "--device", default='CPU', type=str,
                         help="Target device to run the model (default=%(default)s)")  
-    parser.add_argument("-t", "--score_threshold", default=0.15, type=float,
-                        help="Minimum score threshold for landmarks (default=%(default)i)")  
-    parser.add_argument('-c', '--crop', action="store_true", 
-                        help="Center crop frames to a square shape before feeding pose detection model")                     
+    parser.add_argument("-s", "--score_threshold", default=0.2, type=float,
+                        help="Confidence score to determine whether a keypoint prediction is reliable (default=%(default)f)")                     
     parser.add_argument("-o","--output",
                         help="Path to output video file")
     
@@ -247,6 +350,5 @@ if __name__ == "__main__":
                     xml=args.xml,
                     device=args.device, 
                     score_thresh=args.score_threshold,
-                    crop=args.crop,
                     output=args.output)
     pd.run()

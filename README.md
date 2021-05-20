@@ -1,13 +1,15 @@
-# MoveNet single pose tracking on OpenVINO
+# MoveNet Single Pose tracking on OpenVINO
 
 Running Google MoveNet Single Pose models on OpenVINO.
 
-A convolutional neural network model that runs on RGB images and predicts human joint
-locations of a single person. Two variant: Lightning and Thunder, the latter being slower but more accurate.
+A convolutional neural network model that runs on RGB images and predicts [human joint
+locations](https://github.com/tensorflow/tfjs-models/tree/master/pose-detection#coco-keypoints-used-in-movenet-and-posenet) of a single person. Two variant: Lightning and Thunder, the latter being slower but more accurate.
+MoveNet uses an smart cropping based on detections from the previous frame when the input is a sequence of frames. This allows the model to devote its attention and resources to the main subject, resulting in much better prediction quality without sacrificing the speed.
 
-**WIP**. The current implementation of this repository does not include yet the 2 following features useful when the input is a video : the auto cropping (the position of the body in frame N is used to crop the frame N+1 allowing a better precision) and a smoothing filter. 
+![Demo](img/dance.gif)
 
 For Blazepose, a challenger, please visit : [openvino_blazepose](https://github.com/geaxgx/openvino_blazepose)
+
 
 
 ## Install
@@ -22,7 +24,7 @@ You need OpenVINO 2021.3 (does not work with 2021.2) and OpenCV installed on you
 > python3 MovenetOpenvino.py -h                                               
 usage: MovenetOpenvino.py [-h] [-i INPUT] [-p {16,32}]
                           [-m {lightning,thunder}] [--xml XML] [-d DEVICE]
-                          [-t SCORE_THRESHOLD] [-c] [-o OUTPUT]
+                          [-s SCORE_THRESHOLD] [-o OUTPUT]
 
 optional arguments:
   -h, --help            show this help message and exit
@@ -36,13 +38,11 @@ optional arguments:
   --xml XML             Path to an .xml file for model
   -d DEVICE, --device DEVICE
                         Target device to run the model (default=CPU)
-  -t SCORE_THRESHOLD, --score_threshold SCORE_THRESHOLD
-                        Minimum score threshold for landmarks (default=0)
-  -c, --crop            Center crop frames to a square shape before feeding
-                        pose detection model
+  -s SCORE_THRESHOLD, --score_threshold SCORE_THRESHOLD
+                        Confidence score to determine whether a keypoint
+                        prediction is reliable (default=0.200000)
   -o OUTPUT, --output OUTPUT
                         Path to output video file
-
 ```
 **Examples :**
 
@@ -50,13 +50,36 @@ optional arguments:
 
     ```python3 MovenetOpenvino.py```
 
+- To use default webcam camera as input, Thunder model on MyriadX :
+
+    ```python3 MovenetOpenvino.py -d MYRIAD```
+
 - To use a file (video or image) as input :
 
     ```python3 MovenetOpenvino.py -i filename```
 
-- To use Lightning instead of Thunder the version of the landmark model (default="full", other options are "lite" (faster but less accurate) and "heavy" (more accurate but slower). Example :
+- To use Lightning instead of Thunder the version of the landmark model. 
 
     ```python3 BlazeposeOpenvino.py -m lightning```
+
+
+|Keypress|Function|
+|-|-|
+|*space*|Pause
+|c|Show/hide cropping region|
+|f|Show/hide FPS|
+|
+
+## Performance with OpenVINO
+My FPS measurements on a 30 seconds video:
+
+||CPU (i7700k)|MyriadX|
+|-|-|-|
+|MoveNet Thunder|62|11.2|
+|MoveNet Lightning|114|20.1|
+|BlazePose Full|114|12.0|
+|BlazePose Lite|132|19.9|
+|
 
 
 ## The models 
